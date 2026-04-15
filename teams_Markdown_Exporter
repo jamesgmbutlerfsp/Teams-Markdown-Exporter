@@ -283,6 +283,177 @@ function extractMarkdownFromElement(element) {
     return normalizeMarkdown(markdownBlocks) || normalizeInlineText(element.textContent || '');
 }
 
+function escapeHtml(text) {
+    return (text || '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+
+function renderInlineMarkdown(markdown) {
+    let html = escapeHtml(markdown || '');
+    const codeSpans = [];
+
+    html = html.replace(/`([^`]+)`/g, (_, code) => {
+        const placeholder = `__CODE_SPAN_${codeSpans.length}__`;
+        codeSpans.push(`<code>${escapeHtml(code)}</code>`);
+        return placeholder;
+    });
+
+    html = html
+        .replace(/!\[(.*?)\]\((.*?)\)/g, (_, alt, src) => `<img alt="${escapeHtml(alt)}" src="${escapeHtml(src)}">`)
+        .replace(/\[(.*?)\]\((.*?)\)/g, (_, text, href) => `<a href="${escapeHtml(href)}" target="_blank" rel="noopener noreferrer">${text}</a>`)
+        .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+        .replace(/\*(.+?)\*/g, '<em>$1</em>');
+
+    codeSpans.forEach((codeSpan, index) => {
+        html = html.replace(`__CODE_SPAN_${index}__`, codeSpan);
+    });
+
+    return html;
+}
+
+function getListItemInfo(line) {
+    const match = line.match(/^(\s*)([-*]|\d+\.)\s+(.*)$/);
+    if (!match) {
+        return null;
+    }
+
+    return {
+        indent: match[1].length,
+        type: /\d+\./.test(match[2]) ? 'ol' : 'ul',
+        content: match[3]
+    };
+}
+
+function renderMarkdownList(lines, startIndex, baseIndent) {
+    const firstItem = getListItemInfo(lines[startIndex]);
+    if (!firstItem) {
+        return { html: '', nextIndex: startIndex + 1 };
+    }
+
+    const listType = firstItem.type;
+    let html = `<${listType}>`;
+    let index = startIndex;
+
+    while (index < lines.length) {
+        const item = getListItemInfo(lines[index]);
+        if (!item || item.indent < baseIndent || item.type !== listType) {
+            break;
+        }
+
+        if (item.indent > baseIndent) {
+            break;
+        }
+
+        html += `<li>${renderInlineMarkdown(item.content)}`;
+        index += 1;
+
+        while (index < lines.length) {
+            const nextItem = getListItemInfo(lines[index]);
+            if (nextItem) {
+                if (nextItem.indent > baseIndent) {
+                    const nestedList = renderMarkdownList(lines, index, nextItem.indent);
+                    html += nestedList.html;
+                    index = nestedList.nextIndex;
+                    continue;
+                }
+
+                if (nextItem.indent === baseIndent) {
+                    break;
+                }
+
+                if (nextItem.indent < baseIndent) {
+                    break;
+                }
+            }
+
+            if (!lines[index].trim()) {
+                index += 1;
+                continue;
+            }
+
+            html += `<br>${renderInlineMarkdown(lines[index].trim())}`;
+            index += 1;
+        }
+
+        html += '</li>';
+    }
+
+    html += `</${listType}>`;
+    return { html, nextIndex: index };
+}
+
+function renderMarkdownToHtml(markdown) {
+    const lines = (markdown || '').split('\n');
+    const htmlParts = [];
+    let index = 0;
+
+    while (index < lines.length) {
+        const line = lines[index];
+        const trimmedLine = line.trim();
+
+        if (!trimmedLine) {
+            index += 1;
+            continue;
+        }
+
+        if (trimmedLine === '---') {
+            htmlParts.push('<hr>');
+            index += 1;
+            continue;
+        }
+
+        if (trimmedLine.startsWith('```')) {
+            const codeLines = [];
+            index += 1;
+            while (index < lines.length && !lines[index].trim().startsWith('```')) {
+                codeLines.push(lines[index]);
+                index += 1;
+            }
+            if (index < lines.length) {
+                index += 1;
+            }
+            htmlParts.push(`<pre><code>${escapeHtml(codeLines.join('\n'))}</code></pre>`);
+            continue;
+        }
+
+        const headingMatch = trimmedLine.match(/^###\s+(.*)$/);
+        if (headingMatch) {
+            htmlParts.push(`<h3>${renderInlineMarkdown(headingMatch[1])}</h3>`);
+            index += 1;
+            continue;
+        }
+
+        const listItem = getListItemInfo(line);
+        if (listItem) {
+            const listHtml = renderMarkdownList(lines, index, listItem.indent);
+            htmlParts.push(listHtml.html);
+            index = listHtml.nextIndex;
+            continue;
+        }
+
+        const paragraphLines = [trimmedLine];
+        index += 1;
+
+        while (index < lines.length) {
+            const nextLine = lines[index];
+            const nextTrimmedLine = nextLine.trim();
+            if (!nextTrimmedLine || nextTrimmedLine === '---' || nextTrimmedLine.startsWith('```') || nextTrimmedLine.startsWith('### ') || getListItemInfo(nextLine)) {
+                break;
+            }
+            paragraphLines.push(nextTrimmedLine);
+            index += 1;
+        }
+
+        htmlParts.push(`<p>${paragraphLines.map(renderInlineMarkdown).join('<br>')}</p>`);
+    }
+
+    return htmlParts.join('');
+}
+
 function convertToMarkdown(messages, chatName) {
     let markdown = `# ${chatName}\n\n`;
     markdown += `*Teams Chat Export - ${new Date().toLocaleString()}*\n\n---\n\n`;
@@ -438,16 +609,7 @@ function createMarkdownPreview(exportWindow) {
 function updatePreview(exportWindow, markdown) {
     const previewContent = exportWindow.document.querySelector('.preview-content');
     if (previewContent) {
-        let html = markdown
-            .replace(/### (.*?)\n/g, '<h3>$1</h3>')
-            .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
-            .replace(/\*(.*?)\*/g, '<em>$1</em>')
-            .replace(/```([\s\S]*?)```/g, '<pre><code>$1</code></pre>')
-            .replace(/`(.*?)`/g, '<code>$1</code>')
-            .replace(/!\[(.*?)\]\((.*?)\)/g, '<img alt="$1" src="$2">')
-            .replace(/\n\n/g, '<br><br>');
-
-        previewContent.innerHTML = html;
+        previewContent.innerHTML = renderMarkdownToHtml(markdown);
     }
 }
 
@@ -567,9 +729,38 @@ function createStyleSheet(exportWindow) {
             padding: 2px 4px;
             border-radius: 4px;
         }
+        .preview-content ul,
+        .preview-content ol {
+            margin: 0.75em 0;
+            padding-left: 1.5em;
+        }
+        .preview-content li {
+            margin: 0.35em 0;
+        }
+        .preview-content p {
+            margin: 0.75em 0;
+        }
+        .preview-content hr {
+            border: 0;
+            border-top: 1px solid #d0d7de;
+            margin: 1.25em 0;
+        }
+        .preview-content a {
+            color: #0a66c2;
+        }
+        .preview-content img {
+            max-width: 100%;
+            height: auto;
+        }
         .preview-content.dark-theme code {
             background: #2d2d2d;
             color: #e6e6e6;
+        }
+        .preview-content.dark-theme hr {
+            border-top-color: #3d444d;
+        }
+        .preview-content.dark-theme a {
+            color: #7cc0ff;
         }
         .toggle-preview-button,
         .theme-toggle-button {
