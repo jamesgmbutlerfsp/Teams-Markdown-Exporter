@@ -212,6 +212,31 @@ function extractInlineMarkdown(node) {
     }
 
     const tagName = node.tagName.toLowerCase();
+
+    if (tagName === 'img') {
+        return normalizeInlineText(
+            node.getAttribute('alt') ||
+            node.getAttribute('aria-label') ||
+            node.getAttribute('title') ||
+            ''
+        );
+    }
+
+    if (node.getAttribute('data-tid') === 'emoticon-renderer') {
+        const emojiImage = node.querySelector('img[alt], img[aria-label], img[title]');
+        if (emojiImage) {
+            return normalizeInlineText(
+                emojiImage.getAttribute('alt') ||
+                emojiImage.getAttribute('aria-label') ||
+                emojiImage.getAttribute('title') ||
+                node.getAttribute('title') ||
+                ''
+            );
+        }
+
+        return normalizeInlineText(node.getAttribute('title') || '');
+    }
+
     const childContent = Array.from(node.childNodes)
         .map(child => extractInlineMarkdown(child))
         .join(' ')
