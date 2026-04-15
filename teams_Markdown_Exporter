@@ -124,6 +124,64 @@ function getTimestampInfo(timestampElement) {
     };
 }
 
+function parseExportDateTime(value, label) {
+    if (value === null || value === undefined || value === '') {
+        return null;
+    }
+
+    if (value instanceof Date) {
+        const timestamp = value.getTime();
+        if (Number.isNaN(timestamp)) {
+            throw new Error(`Invalid ${label} datetime.`);
+        }
+        return timestamp;
+    }
+
+    if (typeof value === 'number') {
+        if (!Number.isFinite(value)) {
+            throw new Error(`Invalid ${label} datetime.`);
+        }
+        return value;
+    }
+
+    const parsedTimestamp = Date.parse(String(value));
+    if (Number.isNaN(parsedTimestamp)) {
+        throw new Error(`Invalid ${label} datetime: ${value}`);
+    }
+
+    return parsedTimestamp;
+}
+
+function getExportTimeframe(fromDateTime, untilDateTime) {
+    const fromTimestamp = parseExportDateTime(fromDateTime, 'from');
+    const untilTimestamp = parseExportDateTime(untilDateTime, 'until');
+
+    if (Number.isFinite(fromTimestamp) && Number.isFinite(untilTimestamp) && fromTimestamp > untilTimestamp) {
+        throw new Error('The from datetime must be earlier than or equal to the until datetime.');
+    }
+
+    return {
+        fromTimestamp,
+        untilTimestamp
+    };
+}
+
+function isWithinTimeframe(sortTimestamp, timeframe) {
+    if (!Number.isFinite(sortTimestamp)) {
+        return true;
+    }
+
+    if (Number.isFinite(timeframe.fromTimestamp) && sortTimestamp < timeframe.fromTimestamp) {
+        return false;
+    }
+
+    if (Number.isFinite(timeframe.untilTimestamp) && sortTimestamp > timeframe.untilTimestamp) {
+        return false;
+    }
+
+    return true;
+}
+
 function normalizeInlineText(text) {
     return text
         .replace(/\u00a0/g, ' ')
@@ -389,6 +447,35 @@ function extractReactionVisual(reactionElement) {
 
 function sleep(milliseconds) {
     return new Promise(resolve => setTimeout(resolve, milliseconds));
+}
+
+async function scrollToLatestMessages(messagePane, progressInfo) {
+    let stableAttempts = 0;
+    let previousSnapshot = '';
+
+    while (stableAttempts < CONFIG.noNewMessagesThreshold) {
+        const visibleMessages = document.querySelectorAll('.fui-ChatMyMessage, .fui-unstable-ChatItem');
+        const snapshot = `${messagePane.scrollTop}|${messagePane.scrollHeight}|${visibleMessages.length}`;
+
+        messagePane.scrollTop = messagePane.scrollHeight;
+        await sleep(CONFIG.delayTime);
+
+        const distanceFromBottom = Math.abs(messagePane.scrollHeight - messagePane.clientHeight - messagePane.scrollTop);
+        const updatedVisibleMessages = document.querySelectorAll('.fui-ChatMyMessage, .fui-unstable-ChatItem');
+        const updatedSnapshot = `${messagePane.scrollTop}|${messagePane.scrollHeight}|${updatedVisibleMessages.length}`;
+
+        if (progressInfo) {
+            progressInfo.textContent = 'Preparing export... Scrolling to the latest messages';
+        }
+
+        if (distanceFromBottom <= 2 && updatedSnapshot === previousSnapshot && updatedSnapshot === snapshot) {
+            stableAttempts++;
+        } else {
+            stableAttempts = 0;
+        }
+
+        previousSnapshot = updatedSnapshot;
+    }
 }
 
 function isElementVisible(element) {
@@ -1204,7 +1291,7 @@ function createStyleSheet(exportWindow) {
     return style;
 }
 
-async function exportTeamsChat() {
+async function exportTeamsChat(fromDateTime = null, untilDateTime = null) {
     try {
         if (!window.location.hostname.includes('teams.microsoft.com') && !window.location.hostname.includes('teams.cloud.microsoft')) {
             throw new Error('Please run this script on teams.microsoft.com or teams.cloud.microsoft');
@@ -1216,7 +1303,9 @@ async function exportTeamsChat() {
         }
 
         const chatName = getChatName();
+    const timeframe = getExportTimeframe(fromDateTime, untilDateTime);
         const messages = [];
+        const processedMessageIds = new Set();
         let scrollCount = 0;
         let keepScrolling = true;
         let noNewMessagesCount = 0;
@@ -1243,11 +1332,16 @@ async function exportTeamsChat() {
         progressInfo.className = 'progress-info';
         container.appendChild(progressInfo);
 
+        CONFIG.delayTime = parseInt(delayInput.value) || 2000;
+        await scrollToLatestMessages(messagePane, progressInfo);
+
         while (keepScrolling && !stopExport) {
             const beforeCount = messages.length;
+            let foundNewMessagesInView = false;
+            let reachedFromBoundary = false;
 
             CONFIG.delayTime = parseInt(delayInput.value) || 2000;
-            await new Promise(resolve => setTimeout(resolve, CONFIG.delayTime));
+            await sleep(CONFIG.delayTime);
 
             progressInfo.textContent = `Loading messages... Found ${messages.length} so far`;
 
@@ -1258,11 +1352,23 @@ async function exportTeamsChat() {
                 if (!timestamp) continue;
 
                 const messageId = timestamp.id.replace('timestamp-', '');
-                if (messages.find(m => m.id === messageId)) continue;
+                if (processedMessageIds.has(messageId)) continue;
+                processedMessageIds.add(messageId);
+                foundNewMessagesInView = true;
 
                 const sender = getSender(msg);
                 const contentElement = msg.querySelector('[id^="content-"]');
                 const timestampInfo = getTimestampInfo(timestamp);
+
+                if (Number.isFinite(timeframe.fromTimestamp) && Number.isFinite(timestampInfo.sortTimestamp) && timestampInfo.sortTimestamp < timeframe.fromTimestamp) {
+                    reachedFromBoundary = true;
+                    continue;
+                }
+
+                if (!isWithinTimeframe(timestampInfo.sortTimestamp, timeframe)) {
+                    continue;
+                }
+
                 const reactions = await getMessageReactions(msg);
 
                 const images = Array.from(msg.querySelectorAll('img'))
@@ -1290,7 +1396,11 @@ async function exportTeamsChat() {
                 });
             }
 
-            if (messages.length === beforeCount) {
+            if (reachedFromBoundary) {
+                keepScrolling = false;
+            }
+
+            if (!foundNewMessagesInView && messages.length === beforeCount) {
                 noNewMessagesCount++;
                 if (noNewMessagesCount >= CONFIG.noNewMessagesThreshold) {
                     console.log(`No new messages found after ${CONFIG.noNewMessagesThreshold} attempts. Stopping scroll.`);
@@ -1399,7 +1509,7 @@ Teams Chat Export Tool
 1. Make sure you're on teams.microsoft.com
 2. Navigate to the chat you want to export
 3. Click on any message in the chat
-4. Type exportTeamsChat() to start the export
+4. Type exportTeamsChat() to export everything, or exportTeamsChat(fromDateTime, untilDateTime) to limit the timeframe
 5. Use the controls to adjust scroll delay or stop the export
 6. Click "Download as Markdown" when ready
 `);
