@@ -54,6 +54,235 @@ function cleanChatName(name) {
         .trim();
 }
 
+function parseTimeOnDate(timeText, referenceDate) {
+    const parsedTime = Date.parse(`${referenceDate.toDateString()} ${timeText}`);
+    return Number.isNaN(parsedTime) ? null : parsedTime;
+}
+
+function getTimestampSortValue(rawTimestamp) {
+    if (!rawTimestamp) {
+        return null;
+    }
+
+    const normalizedTimestamp = rawTimestamp
+        .replace(/[\u200e\u200f]/g, '')
+        .replace(/\s+/g, ' ')
+        .trim();
+
+    const directParse = Date.parse(normalizedTimestamp);
+    if (!Number.isNaN(directParse)) {
+        return directParse;
+    }
+
+    const now = new Date();
+    const relativeMatch = normalizedTimestamp.match(/^(Today|Yesterday)\s*(?:at)?\s*(.+)$/i);
+    if (relativeMatch) {
+        const referenceDate = new Date(now);
+        if (relativeMatch[1].toLowerCase() === 'yesterday') {
+            referenceDate.setDate(referenceDate.getDate() - 1);
+        }
+
+        return parseTimeOnDate(relativeMatch[2], referenceDate);
+    }
+
+    const weekdayMatch = normalizedTimestamp.match(/^(Sunday|Monday|Tuesday|Wednesday|Thursday|Friday|Saturday)\s*(?:at)?\s*(.+)$/i);
+    if (weekdayMatch) {
+        const weekdayNames = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
+        const targetDay = weekdayNames.indexOf(weekdayMatch[1].toLowerCase());
+        if (targetDay !== -1) {
+            const referenceDate = new Date(now);
+            let dayOffset = (referenceDate.getDay() - targetDay + 7) % 7;
+            if (dayOffset === 0 && Date.parse(weekdayMatch[2]) > now.getTime()) {
+                dayOffset = 7;
+            }
+            referenceDate.setDate(referenceDate.getDate() - dayOffset);
+
+            return parseTimeOnDate(weekdayMatch[2], referenceDate);
+        }
+    }
+
+    const timeOnlyParse = parseTimeOnDate(normalizedTimestamp, now);
+    return timeOnlyParse;
+}
+
+function getTimestampInfo(timestampElement) {
+    const rawCandidates = [
+        timestampElement.getAttribute('datetime'),
+        timestampElement.getAttribute('dateTime'),
+        timestampElement.getAttribute('title'),
+        timestampElement.getAttribute('aria-label'),
+        timestampElement.textContent
+    ];
+
+    const displayTimestamp = (timestampElement.textContent || '').trim();
+    const rawTimestamp = rawCandidates.find(value => value && value.trim());
+
+    return {
+        displayTimestamp,
+        sortTimestamp: getTimestampSortValue(rawTimestamp)
+    };
+}
+
+function normalizeInlineText(text) {
+    return text
+        .replace(/\u00a0/g, ' ')
+        .replace(/[\t\r\n]+/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+}
+
+function normalizeMarkdown(markdown) {
+    return markdown
+        .replace(/\u00a0/g, ' ')
+        .replace(/[ \t]+\n/g, '\n')
+        .replace(/\n{3,}/g, '\n\n')
+        .trim();
+}
+
+function extractInlineMarkdown(node) {
+    if (!node) {
+        return '';
+    }
+
+    if (node.nodeType === Node.TEXT_NODE) {
+        return normalizeInlineText(node.textContent || '');
+    }
+
+    if (node.nodeType !== Node.ELEMENT_NODE) {
+        return '';
+    }
+
+    const tagName = node.tagName.toLowerCase();
+    const childContent = Array.from(node.childNodes)
+        .map(child => extractInlineMarkdown(child))
+        .join(' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+
+    if (!childContent && tagName !== 'br') {
+        return '';
+    }
+
+    switch (tagName) {
+        case 'strong':
+        case 'b':
+            return `**${childContent}**`;
+        case 'em':
+        case 'i':
+            return `*${childContent}*`;
+        case 'code':
+            return `\`${childContent}\``;
+        case 'a': {
+            const href = node.getAttribute('href');
+            return href ? `[${childContent || href}](${href})` : childContent;
+        }
+        case 'br':
+            return '\n';
+        default:
+            return childContent;
+    }
+}
+
+function extractTextAndNestedLists(node, indentLevel) {
+    const textParts = [];
+    const nestedLists = [];
+
+    Array.from(node.childNodes).forEach(child => {
+        if (child.nodeType === Node.ELEMENT_NODE) {
+            const tagName = child.tagName.toLowerCase();
+            if (tagName === 'ul' || tagName === 'ol') {
+                nestedLists.push(extractListMarkdown(child, indentLevel));
+                return;
+            }
+
+            if (tagName === 'div' || tagName === 'p') {
+                const nestedContent = extractTextAndNestedLists(child, indentLevel);
+                if (nestedContent.text) {
+                    textParts.push(nestedContent.text);
+                }
+                nestedLists.push(...nestedContent.nestedLists);
+                return;
+            }
+        }
+
+        const inlineContent = extractInlineMarkdown(child);
+        if (inlineContent) {
+            textParts.push(inlineContent);
+        }
+    });
+
+    return {
+        text: normalizeInlineText(textParts.join(' ')),
+        nestedLists
+    };
+}
+
+function extractListItemMarkdown(listItem, indentLevel, marker) {
+    const { text, nestedLists } = extractTextAndNestedLists(listItem, indentLevel + 1);
+    const indentation = '  '.repeat(indentLevel);
+    let markdown = `${indentation}${marker} ${text || '[No message content]'}`;
+
+    if (nestedLists.length > 0) {
+        markdown += `\n${nestedLists.join('\n')}`;
+    }
+
+    return markdown;
+}
+
+function extractListMarkdown(listElement, indentLevel = 0) {
+    const isOrderedList = listElement.tagName.toLowerCase() === 'ol';
+    const startIndex = isOrderedList ? parseInt(listElement.getAttribute('start'), 10) || 1 : 1;
+
+    return Array.from(listElement.children)
+        .filter(child => child.tagName && child.tagName.toLowerCase() === 'li')
+        .map((listItem, index) => {
+            const marker = isOrderedList ? `${startIndex + index}.` : '-';
+            return extractListItemMarkdown(listItem, indentLevel, marker);
+        })
+        .join('\n');
+}
+
+function extractMarkdownFromElement(element) {
+    if (!element) {
+        return '';
+    }
+
+    const markdownBlocks = Array.from(element.childNodes)
+        .map(node => {
+            if (node.nodeType === Node.TEXT_NODE) {
+                return normalizeInlineText(node.textContent || '');
+            }
+
+            if (node.nodeType !== Node.ELEMENT_NODE) {
+                return '';
+            }
+
+            const tagName = node.tagName.toLowerCase();
+
+            if (tagName === 'ul' || tagName === 'ol') {
+                return extractListMarkdown(node);
+            }
+
+            if (tagName === 'div' || tagName === 'p') {
+                const { text, nestedLists } = extractTextAndNestedLists(node, 1);
+                const blockParts = [];
+                if (text) {
+                    blockParts.push(text);
+                }
+                if (nestedLists.length > 0) {
+                    blockParts.push(nestedLists.join('\n'));
+                }
+                return blockParts.join('\n');
+            }
+
+            return extractInlineMarkdown(node);
+        })
+        .filter(Boolean)
+        .join('\n\n');
+
+    return normalizeMarkdown(markdownBlocks) || normalizeInlineText(element.textContent || '');
+}
+
 function convertToMarkdown(messages, chatName) {
     let markdown = `# ${chatName}\n\n`;
     markdown += `*Teams Chat Export - ${new Date().toLocaleString()}*\n\n---\n\n`;
@@ -377,8 +606,8 @@ function createStyleSheet(exportWindow) {
 
 async function exportTeamsChat() {
     try {
-        if (!window.location.hostname.includes('teams.microsoft.com')) {
-            throw new Error('Please run this script on teams.microsoft.com');
+        if (!window.location.hostname.includes('teams.microsoft.com') && !window.location.hostname.includes('teams.cloud.microsoft')) {
+            throw new Error('Please run this script on teams.microsoft.com or teams.cloud.microsoft');
         }
 
         const messagePane = document.querySelector('[data-tid="message-pane-list-viewport"]');
@@ -417,9 +646,7 @@ async function exportTeamsChat() {
         while (keepScrolling && !stopExport) {
             const beforeCount = messages.length;
 
-            CONFIG.delayTime = parseInt(delayInput.value) || 1000;
-
-            messagePane.scrollTop = 0;
+            CONFIG.delayTime = parseInt(delayInput.value) || 2000;
             await new Promise(resolve => setTimeout(resolve, CONFIG.delayTime));
 
             progressInfo.textContent = `Loading messages... Found ${messages.length} so far`;
@@ -435,6 +662,7 @@ async function exportTeamsChat() {
 
                 const sender = getSender(msg);
                 const contentElement = msg.querySelector('[id^="content-"]');
+                const timestampInfo = getTimestampInfo(timestamp);
 
                 const images = Array.from(msg.querySelectorAll('img'))
                     .filter(img => {
@@ -450,11 +678,13 @@ async function exportTeamsChat() {
 
                 messages.push({
                     id: messageId,
-                    timestamp: timestamp.textContent,
+                    timestamp: timestampInfo.displayTimestamp,
+                    sortTimestamp: timestampInfo.sortTimestamp,
                     sender: sender,
-                    content: contentElement ? contentElement.textContent.trim() : '',
+                    content: extractMarkdownFromElement(contentElement),
                     images: images,
-                    isMyMessage: msg.classList.contains('fui-ChatMyMessage')
+                    isMyMessage: msg.classList.contains('fui-ChatMyMessage'),
+                    captureOrder: messages.length
                 });
             });
 
@@ -467,9 +697,26 @@ async function exportTeamsChat() {
             } else {
                 noNewMessagesCount = 0;
             }
+            
+            messagePane.scrollTop -= (messagePane.clientHeight-10);
         }
 
-        messages.reverse().forEach(msg => {
+        messages.sort((left, right) => {
+            const leftHasTimestamp = Number.isFinite(left.sortTimestamp);
+            const rightHasTimestamp = Number.isFinite(right.sortTimestamp);
+
+            if (leftHasTimestamp && rightHasTimestamp && left.sortTimestamp !== right.sortTimestamp) {
+                return left.sortTimestamp - right.sortTimestamp;
+            }
+
+            if (leftHasTimestamp !== rightHasTimestamp) {
+                return leftHasTimestamp ? -1 : 1;
+            }
+
+            return left.captureOrder - right.captureOrder;
+        });
+
+        messages.forEach(msg => {
             const messageDiv = exportWindow.document.createElement('div');
             messageDiv.className = `message ${msg.isMyMessage ? 'my-message' : 'other-message'}`;
 
