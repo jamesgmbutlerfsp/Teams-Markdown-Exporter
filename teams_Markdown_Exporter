@@ -3,6 +3,7 @@ const CONFIG = {
     delayTime: 1000,
     logToConsole: true,
     maxScrollAttempts: 0,
+    reactionHoverDelay: 150,
     retryAttempts: 5,
     noNewMessagesThreshold: 3,
     previewTheme: 'light'
@@ -283,6 +284,355 @@ function extractMarkdownFromElement(element) {
     return normalizeMarkdown(markdownBlocks) || normalizeInlineText(element.textContent || '');
 }
 
+function deduplicateBy(items, getKey) {
+    const seen = new Set();
+
+    return items.filter(item => {
+        const key = getKey(item);
+        if (!key || seen.has(key)) {
+            return false;
+        }
+
+        seen.add(key);
+        return true;
+    });
+}
+
+function extractReactionCount(reactionText) {
+    const matches = (reactionText || '').match(/\b\d+\b/g);
+    if (!matches || matches.length === 0) {
+        return 1;
+    }
+
+    return parseInt(matches[matches.length - 1], 10) || 1;
+}
+
+function getReferencedElementText(sourceElement, attributeName) {
+    const attributeValue = sourceElement.getAttribute(attributeName);
+    if (!attributeValue) {
+        return '';
+    }
+
+    return attributeValue
+        .split(/\s+/)
+        .map(id => {
+            const referencedElement = document.getElementById(id);
+            return referencedElement ? normalizeInlineText(referencedElement.textContent || '') : '';
+        })
+        .filter(Boolean)
+        .join(' ');
+}
+
+function getReactionMetadataText(reactionElement) {
+    return [
+        reactionElement.getAttribute('aria-label'),
+        reactionElement.getAttribute('aria-description'),
+        reactionElement.getAttribute('title'),
+        getReferencedElementText(reactionElement, 'aria-labelledby'),
+        getReferencedElementText(reactionElement, 'aria-describedby'),
+        reactionElement.textContent
+    ]
+        .map(value => normalizeInlineText(value || ''))
+        .filter(Boolean)
+        .join(' | ');
+}
+
+function extractReactionUsers(reactionText) {
+    if (!reactionText) {
+        return [];
+    }
+
+    const userMatches = [
+        ...reactionText.matchAll(/(?:from|by)\s+([^.|;]+)/gi),
+        ...reactionText.matchAll(/([^.|;]+?)\s+reacted\s+(?:with|using)?/gi)
+    ];
+
+    const users = userMatches
+        .flatMap(match => match[1].split(/,|\band\b/gi))
+        .map(user => user.replace(/\b\d+\s+others?\b/gi, '').trim())
+        .map(user => user.replace(/^[:\-\s]+|[:\-\s]+$/g, ''))
+        .filter(Boolean)
+        .filter(user => !/^(like|heart|laugh|surprised|sad|angry|reaction|reactions)$/i.test(user));
+
+    return [...new Set(users)];
+}
+
+function cleanReactionLabel(reactionText) {
+    if (!reactionText) {
+        return '';
+    }
+
+    return reactionText
+        .replace(/[\u200e\u200f]/g, '')
+        .replace(/\b\d+\b/g, '')
+        .replace(/\b(reaction|reactions|reacted|people|person|users?|user|by|with|total|summary|from)\b/gi, '')
+        .replace(/[^|]*\|/g, '')
+        .replace(/[.,:;()]/g, ' ')
+        .replace(/\s+/g, ' ')
+        .replace(/[.\-:,;]+$/g, '')
+        .trim();
+}
+
+function extractReactionVisual(reactionElement) {
+    const emojiImage = reactionElement.querySelector('img[alt], img[aria-label]');
+    if (emojiImage) {
+        return normalizeInlineText(emojiImage.getAttribute('alt') || emojiImage.getAttribute('aria-label') || '');
+    }
+
+    const emojiMatch = (reactionElement.textContent || '').match(/[\p{Extended_Pictographic}\u2600-\u27BF]/u);
+    if (emojiMatch) {
+        return emojiMatch[0];
+    }
+
+    return '';
+}
+
+function sleep(milliseconds) {
+    return new Promise(resolve => setTimeout(resolve, milliseconds));
+}
+
+function isElementVisible(element) {
+    if (!element) {
+        return false;
+    }
+
+    const rect = element.getBoundingClientRect();
+    const style = window.getComputedStyle(element);
+
+    return rect.width > 0 &&
+        rect.height > 0 &&
+        style.visibility !== 'hidden' &&
+        style.display !== 'none';
+}
+
+function triggerReactionHover(reactionElement, eventNames) {
+    const rect = reactionElement.getBoundingClientRect();
+    const clientX = rect.left + (rect.width / 2);
+    const clientY = rect.top + (rect.height / 2);
+
+    eventNames.forEach(eventName => {
+        reactionElement.dispatchEvent(new MouseEvent(eventName, {
+            view: window,
+            bubbles: true,
+            cancelable: true,
+            clientX,
+            clientY
+        }));
+
+        reactionElement.dispatchEvent(new PointerEvent(eventName, {
+            view: window,
+            bubbles: true,
+            cancelable: true,
+            clientX,
+            clientY,
+            pointerId: 1,
+            pointerType: 'mouse',
+            isPrimary: true
+        }));
+    });
+}
+
+function triggerReactionActivation(reactionElement) {
+    const rect = reactionElement.getBoundingClientRect();
+    const clientX = rect.left + (rect.width / 2);
+    const clientY = rect.top + (rect.height / 2);
+
+    ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach(eventName => {
+        const EventType = eventName.startsWith('pointer') ? PointerEvent : MouseEvent;
+        reactionElement.dispatchEvent(new EventType(eventName, {
+            view: window,
+            bubbles: true,
+            cancelable: true,
+            clientX,
+            clientY,
+            pointerId: 1,
+            pointerType: 'mouse',
+            isPrimary: true
+        }));
+    });
+
+    if (typeof reactionElement.click === 'function') {
+        reactionElement.click();
+    }
+}
+
+function dismissReactionPopover(reactionElement) {
+    triggerReactionHover(reactionElement, ['pointerleave', 'mouseleave', 'mouseout']);
+    document.dispatchEvent(new KeyboardEvent('keydown', {
+        key: 'Escape',
+        code: 'Escape',
+        bubbles: true,
+        cancelable: true
+    }));
+
+    if (typeof reactionElement.blur === 'function') {
+        reactionElement.blur();
+    }
+}
+
+function extractReactionUsersFromPopover(popoverElement) {
+    if (!popoverElement) {
+        return [];
+    }
+
+    const userItems = Array.from(popoverElement.querySelectorAll('[data-tid="diverse-reaction-user-list-item"]'));
+    const users = userItems.map(item => {
+        const namedElement = item.querySelector('.fui-MenuItem__content span[dir="auto"], .fui-MenuItem__content span');
+        if (namedElement) {
+            return normalizeInlineText(namedElement.textContent || '');
+        }
+
+        const ariaLabel = normalizeInlineText(item.getAttribute('aria-label') || '');
+        const chatMatch = ariaLabel.match(/^Chat with\s+([^,]+)/i);
+        return chatMatch ? chatMatch[1].trim() : ariaLabel;
+    }).filter(Boolean);
+
+    return [...new Set(users)];
+}
+
+async function getReactionUsersFromHover(reactionElement) {
+    const existingPopovers = new Set(Array.from(document.querySelectorAll('[data-tid="diverse-reaction-user-list"]')));
+    const toolbar = reactionElement.closest('[data-tid="diverse-reaction-summary"]');
+
+    reactionElement.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+
+    if (typeof reactionElement.focus === 'function') {
+        reactionElement.focus({ preventScroll: true });
+    }
+
+    if (toolbar) {
+        triggerReactionHover(toolbar, ['pointerenter', 'mouseenter', 'mouseover', 'mousemove']);
+    }
+
+    triggerReactionHover(reactionElement, ['pointerenter', 'mouseenter', 'mouseover', 'mousemove']);
+
+    for (let attempt = 0; attempt < 8; attempt++) {
+        if (attempt === 2 || attempt === 5) {
+            triggerReactionActivation(reactionElement);
+        }
+
+        await sleep(CONFIG.reactionHoverDelay);
+
+        const popovers = Array.from(document.querySelectorAll('[data-tid="diverse-reaction-user-list"]'))
+            .filter(popover => isElementVisible(popover.closest('[role="presentation"]') || popover));
+
+        const matchingPopover = popovers.find(popover => !existingPopovers.has(popover)) || popovers[popovers.length - 1];
+        const users = extractReactionUsersFromPopover(matchingPopover);
+        if (users.length > 0) {
+            dismissReactionPopover(reactionElement);
+            await sleep(50);
+            return users;
+        }
+    }
+
+    dismissReactionPopover(reactionElement);
+    await sleep(50);
+    return [];
+}
+
+function isReactionPlaceholderElement(reactionElement) {
+    if (!reactionElement) {
+        return false;
+    }
+
+    return Boolean(
+        reactionElement.closest('[data-tid="reactions-summary-item-renderer"]') ||
+        reactionElement.closest('[data-tid="add-reaction-picker-entry-point-button"]') ||
+        reactionElement.closest('.add-reaction-picker-entry-point-button') ||
+        reactionElement.matches('[data-tid="diverse-reaction-summary"]') ||
+        reactionElement.matches('[data-tid="reactions-summary-item-renderer"]') ||
+        reactionElement.matches('[data-tid="add-reaction-picker-entry-point-button"]') ||
+        reactionElement.matches('.add-reaction-picker-entry-point-button') ||
+        reactionElement.getAttribute('aria-label') === 'Reaction summary' ||
+        reactionElement.getAttribute('aria-label') === 'More reactions' ||
+        reactionElement.getAttribute('title') === 'More reactions'
+    );
+}
+
+async function getReactionInfo(reactionElement) {
+    if (isReactionPlaceholderElement(reactionElement)) {
+        return null;
+    }
+
+    const rawLabel = getReactionMetadataText(reactionElement);
+
+    if (!rawLabel) {
+        return null;
+    }
+
+    if (/add reaction|react to this message|open reactions?|more reactions?|show reactions?|reaction summary/i.test(rawLabel)) {
+        return null;
+    }
+
+    const visual = extractReactionVisual(reactionElement);
+    const label = cleanReactionLabel(rawLabel) || visual;
+    if (!label && !visual) {
+        return null;
+    }
+
+    const hoverUsers = await getReactionUsersFromHover(reactionElement);
+    const users = [...new Set([...extractReactionUsers(rawLabel), ...hoverUsers])];
+
+    return {
+        label: label || visual,
+        visual,
+        count: extractReactionCount(rawLabel),
+        users,
+        rawLabel
+    };
+}
+
+async function getMessageReactions(messageElement) {
+    const reactionSelectors = [
+        'button[data-tid="diverse-reaction-pill-button"]',
+        '[data-tid="diverse-reaction-pill-button"]',
+        '[data-tid*="reaction"]',
+        '[class*="reaction"]',
+        '[id*="reaction"]',
+        'button[aria-label*="reaction"]',
+        '[aria-label*="reacted"]',
+        '[title*="reaction"]'
+    ];
+
+    const reactionElements = deduplicateBy(
+        reactionSelectors.flatMap(selector => Array.from(messageElement.querySelectorAll(selector))),
+        element => element
+    );
+
+    const reactions = [];
+    for (const reactionElement of reactionElements) {
+        const reaction = await getReactionInfo(reactionElement);
+        if (reaction) {
+            reactions.push(reaction);
+        }
+    }
+
+    return deduplicateBy(
+        reactions,
+        reaction => `${reaction.label}|${reaction.count}|${reaction.users.join(',')}`
+    );
+}
+
+function formatReactionSummary(reaction) {
+    const prefix = reaction.visual && reaction.visual !== reaction.label
+        ? `${reaction.visual} `
+        : '';
+
+    const userSummary = reaction.users && reaction.users.length > 0
+        ? ` by ${reaction.users.join(', ')}`
+        : '';
+
+    return `${prefix}${reaction.label}${reaction.count > 1 ? ` x${reaction.count}` : ''}${userSummary}`.trim();
+}
+
+function createReactionMarkdown(reactions) {
+    if (!reactions || reactions.length === 0) {
+        return '';
+    }
+
+    return `**Reactions:** ${reactions.map(formatReactionSummary).join(', ')}`;
+}
+
 function escapeHtml(text) {
     return (text || '')
         .replace(/&/g, '&amp;')
@@ -454,6 +804,40 @@ function renderMarkdownToHtml(markdown) {
     return htmlParts.join('');
 }
 
+function getPreviewTrustedTypesPolicy(targetWindow) {
+    if (!targetWindow || !targetWindow.trustedTypes || typeof targetWindow.trustedTypes.createPolicy !== 'function') {
+        return null;
+    }
+
+    if (targetWindow.__teamsMarkdownExporterTrustedTypesPolicy) {
+        return targetWindow.__teamsMarkdownExporterTrustedTypesPolicy;
+    }
+
+    try {
+        targetWindow.__teamsMarkdownExporterTrustedTypesPolicy = targetWindow.trustedTypes.createPolicy(
+            'teams-markdown-exporter-preview',
+            {
+                createHTML: html => html
+            }
+        );
+    } catch (error) {
+        targetWindow.__teamsMarkdownExporterTrustedTypesPolicy = null;
+    }
+
+    return targetWindow.__teamsMarkdownExporterTrustedTypesPolicy;
+}
+
+function setPreviewHtml(previewElement, html, targetWindow) {
+    const trustedTypesPolicy = getPreviewTrustedTypesPolicy(targetWindow);
+
+    if (trustedTypesPolicy) {
+        previewElement.innerHTML = trustedTypesPolicy.createHTML(html);
+        return;
+    }
+
+    previewElement.textContent = html.replace(/<[^>]+>/g, '');
+}
+
 function convertToMarkdown(messages, chatName) {
     let markdown = `# ${chatName}\n\n`;
     markdown += `*Teams Chat Export - ${new Date().toLocaleString()}*\n\n---\n\n`;
@@ -462,6 +846,11 @@ function convertToMarkdown(messages, chatName) {
         markdown += `### ${msg.sender} (${msg.timestamp})\n\n`;
         let content = msg.content.replace(/`([^`]+)`/g, '```\n$1\n```');
         markdown += `${content}\n\n`;
+
+        const reactionMarkdown = createReactionMarkdown(msg.reactions);
+        if (reactionMarkdown) {
+            markdown += `${reactionMarkdown}\n\n`;
+        }
 
         if (msg.images && msg.images.length > 0) {
             msg.images.forEach(image => {
@@ -609,7 +998,7 @@ function createMarkdownPreview(exportWindow) {
 function updatePreview(exportWindow, markdown) {
     const previewContent = exportWindow.document.querySelector('.preview-content');
     if (previewContent) {
-        previewContent.innerHTML = renderMarkdownToHtml(markdown);
+        setPreviewHtml(previewContent, renderMarkdownToHtml(markdown), exportWindow);
     }
 }
 
@@ -639,6 +1028,23 @@ function createStyleSheet(exportWindow) {
         .timestamp { color: #666; font-size: 0.8em; }
         .sender { font-weight: bold; color: #2b579a; margin: 5px 0; }
         .content { margin-top: 5px; white-space: pre-wrap; }
+        .reactions {
+            margin-top: 10px;
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+        }
+        .reaction-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 4px 10px;
+            background: #eef4ff;
+            border: 1px solid #cdddfb;
+            border-radius: 999px;
+            font-size: 0.9em;
+            color: #294c7a;
+        }
         .images { margin-top: 10px; }
         .images img { max-width: 300px; margin: 5px; border: 1px solid #ddd; border-radius: 4px; }
         .export-info { 
@@ -748,6 +1154,9 @@ function createStyleSheet(exportWindow) {
         .preview-content a {
             color: #0a66c2;
         }
+        .preview-content strong {
+            font-weight: 600;
+        }
         .preview-content img {
             max-width: 100%;
             height: auto;
@@ -844,16 +1253,17 @@ async function exportTeamsChat() {
 
             const messageElements = document.querySelectorAll('.fui-ChatMyMessage, .fui-unstable-ChatItem');
 
-            messageElements.forEach(msg => {
+            for (const msg of messageElements) {
                 const timestamp = msg.querySelector('[id^="timestamp-"]');
-                if (!timestamp) return;
+                if (!timestamp) continue;
 
                 const messageId = timestamp.id.replace('timestamp-', '');
-                if (messages.find(m => m.id === messageId)) return;
+                if (messages.find(m => m.id === messageId)) continue;
 
                 const sender = getSender(msg);
                 const contentElement = msg.querySelector('[id^="content-"]');
                 const timestampInfo = getTimestampInfo(timestamp);
+                const reactions = await getMessageReactions(msg);
 
                 const images = Array.from(msg.querySelectorAll('img'))
                     .filter(img => {
@@ -873,11 +1283,12 @@ async function exportTeamsChat() {
                     sortTimestamp: timestampInfo.sortTimestamp,
                     sender: sender,
                     content: extractMarkdownFromElement(contentElement),
+                    reactions: reactions,
                     images: images,
                     isMyMessage: msg.classList.contains('fui-ChatMyMessage'),
                     captureOrder: messages.length
                 });
-            });
+            }
 
             if (messages.length === beforeCount) {
                 noNewMessagesCount++;
@@ -927,6 +1338,20 @@ async function exportTeamsChat() {
             messageDiv.appendChild(senderDiv);
             messageDiv.appendChild(contentDiv);
 
+            if (msg.reactions && msg.reactions.length > 0) {
+                const reactionsDiv = exportWindow.document.createElement('div');
+                reactionsDiv.className = 'reactions';
+
+                msg.reactions.forEach(reaction => {
+                    const reactionBadge = exportWindow.document.createElement('span');
+                    reactionBadge.className = 'reaction-badge';
+                    reactionBadge.textContent = formatReactionSummary(reaction);
+                    reactionsDiv.appendChild(reactionBadge);
+                });
+
+                messageDiv.appendChild(reactionsDiv);
+            }
+
             if (msg.images.length > 0) {
                 const imagesDiv = exportWindow.document.createElement('div');
                 imagesDiv.className = 'images';
@@ -953,6 +1378,8 @@ async function exportTeamsChat() {
             updatePreview(exportWindow, markdown);
             fileNameInput.value = `${titleInput.value.replace(/[^a-z0-9]/gi, '_').toLowerCase()}-${new Date().toISOString().split('T')[0]}`;
         });
+
+        updatePreview(exportWindow, convertToMarkdown(messages, titleInput.value));
 
         const exportInfo = exportWindow.document.createElement('div');
         exportInfo.className = 'export-info';
